@@ -28,30 +28,25 @@ use models::WdTagger;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Config {
-    #[arg()]
-    input_dir: String,
+    input_dir: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv()?;
     let config = Config::parse();
-    let input_dir = dunce::canonicalize(Path::new(&config.input_dir))?;
+    let input_dir = dunce::canonicalize(&config.input_dir)?;
 
     let s3_client = Arc::new(create_s3_client()?);
     let qdrant_client = Arc::new(Qdrant::from_url(env::var("QDRANT_URL")?.as_str()).build()?);
-    let model = Arc::new(WdTagger::new(0, 16)?);
+    let model = WdTagger::new(0)?;
 
-    let collection_name = Arc::new(env::var("COLLECTION_NAME")?);
-    ensure_image_collection_exists(
-        &qdrant_client,
-        model.output_size as u64,
-        collection_name.as_str(),
-    )
-    .await?;
+    let collection_name: &'static str = Box::leak(env::var("COLLECTION_NAME")?.into_boxed_str());
+    ensure_image_collection_exists(&qdrant_client, model.output_size as u64, collection_name)
+        .await?;
 
     let entries = get_image_entries(&input_dir);
-    let pb = Arc::new(ProgressBar::new(entries.len() as u64));
+    let pb = ProgressBar::new(entries.len() as u64);
     pb.set_style(indicatif::ProgressStyle::with_template(
         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
     )?);
@@ -121,19 +116,19 @@ async fn process_images(
     entries: Vec<PathBuf>,
     s3_client: Arc<Client>,
     qdrant_client: Arc<Qdrant>,
-    model: Arc<WdTagger>,
-    collection_name: Arc<String>,
-    pb: Arc<ProgressBar>,
+    model: WdTagger,
+    collection_name: &'static str,
+    pb: ProgressBar,
 ) -> Result<()> {
-    let bucket = Arc::new(env::var("BUCKET_NAME")?);
-    let url = Arc::new(format!("{}/{}", env::var("ENDPOINT")?, bucket));
+    let bucket: &'static str = Box::leak(env::var("BUCKET_NAME")?.into_boxed_str());
+    let url: &'static str =
+        Box::leak(format!("{}/{}", env::var("ENDPOINT")?, bucket).into_boxed_str());
     let cpu = std::thread::available_parallelism()?.get();
 
     pb.wrap_stream(stream::iter(entries))
         .map(|entry| {
             let s3_client = s3_client.clone();
-            let bucket = bucket.clone();
-            tokio::spawn(async move { process_single_image(entry, s3_client, bucket).await })
+            tokio::spawn(async move { process_single_image(entry, &s3_client, bucket).await })
         })
         .buffer_unordered(cpu * 2)
         .map(|x| x?)
@@ -146,15 +141,12 @@ async fn process_images(
         .map(|result| {
             let s3_client = s3_client.clone();
             let qdrant_client = qdrant_client.clone();
-            let url = url.clone();
-            let bucket = bucket.clone();
-            let collection_name = collection_name.clone();
 
             tokio::spawn(async move {
                 upload_and_index(
                     result?,
-                    s3_client,
-                    qdrant_client,
+                    &s3_client,
+                    &qdrant_client,
                     url,
                     bucket,
                     collection_name,
@@ -175,8 +167,8 @@ async fn process_images(
 
 async fn process_single_image(
     entry: PathBuf,
-    s3_client: Arc<Client>,
-    bucket: Arc<String>,
+    s3_client: &Client,
+    bucket: &str,
 ) -> Result<(PathBuf, Option<image::DynamicImage>, String)> {
     let mut hasher = blake3::Hasher::new();
     let hash = hasher.update_mmap(&entry)?.finalize().to_hex().to_string();
@@ -207,7 +199,7 @@ async fn process_single_image(
 
 async fn generate_vector(
     data: (PathBuf, Option<image::DynamicImage>, String),
-    model: Arc<WdTagger>,
+    model: WdTagger,
 ) -> Result<(PathBuf, Option<Vec<f32>>, String)> {
     let (path, img, hash) = data;
     let vec = match img {
@@ -219,11 +211,11 @@ async fn generate_vector(
 
 async fn upload_and_index(
     data: (PathBuf, Option<Vec<f32>>, String),
-    s3_client: Arc<Client>,
-    qdrant_client: Arc<Qdrant>,
-    url: Arc<String>,
-    bucket: Arc<String>,
-    collection_name: Arc<String>,
+    s3_client: &Client,
+    qdrant_client: &Qdrant,
+    url: &str,
+    bucket: &str,
+    collection_name: &str,
 ) -> Result<()> {
     let (path, vec, hash) = data;
 
@@ -250,7 +242,7 @@ async fn upload_and_index(
     let path_str = path.file_name().unwrap().to_str().unwrap().to_string();
     qdrant_client
         .upsert_points(UpsertPointsBuilder::new(
-            collection_name.as_str(),
+            collection_name,
             vec![PointStruct::new(
                 uuid::Uuid::new_v4().to_string(),
                 vec,
@@ -266,7 +258,7 @@ async fn upload_and_index(
     Ok(())
 }
 
-async fn handle_result(result: Result<()>, pb: Arc<ProgressBar>) {
+async fn handle_result(result: Result<()>, pb: ProgressBar) {
     if let Err(e) = result {
         pb.println(format!("Error: {:?}", e));
     }

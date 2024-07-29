@@ -31,15 +31,10 @@ const QDRANT_SCORE_THRESHOLD: f32 = 0.5;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Config {
-    #[arg()]
-    input: String,
-
-    #[arg()]
-    output: Option<String>,
-
+    input: PathBuf,
+    output: Option<PathBuf>,
     #[arg(short, long, default_value_t = DEFAULT_LIMIT)]
     limit: usize,
-
     #[arg(short, long, default_value_t = QDRANT_SCORE_THRESHOLD)]
     score_threshold: f32,
 }
@@ -49,8 +44,8 @@ async fn main() -> Result<()> {
     dotenv()?;
     let config = Config::parse();
 
-    let input = dunce::canonicalize(Path::new(&config.input))
-        .with_context(|| "Failed to canonicalize input path")?;
+    let input =
+        dunce::canonicalize(&config.input).with_context(|| "Failed to canonicalize input path")?;
     let output = get_output_path(&input, &config.output)
         .with_context(|| "Failed to determine output path")?;
     fs::create_dir_all(&output)
@@ -63,7 +58,7 @@ async fn main() -> Result<()> {
         validate_single_image_input(&input)?
     };
 
-    let model = WdTagger::new(0, 2).with_context(|| "Failed to initialize WdTagger model")?;
+    let model = WdTagger::new(0).with_context(|| "Failed to initialize WdTagger model")?;
 
     let client = create_qdrant_client().with_context(|| "Failed to create Qdrant client")?;
     let collection_name = env::var("COLLECTION_NAME")
@@ -100,13 +95,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_output_path(input: &Path, output: &Option<String>) -> Result<PathBuf> {
+fn get_output_path(input: &Path, output: &Option<PathBuf>) -> Result<PathBuf> {
     match output {
         None => Ok(match input.is_dir() {
             true => input.parent().unwrap().join("output"),
             false => input.parent().unwrap().to_path_buf(),
         }),
-        Some(output) => Ok(PathBuf::from(output)),
+        Some(output) => Ok(output.clone()),
     }
 }
 
@@ -293,14 +288,12 @@ fn get_image_entries<P: AsRef<Path>>(root_path: P) -> Vec<(String, Vec<PathBuf>)
             let path = entry.path();
             let folder_name = path.file_name()?.to_str()?.to_string();
 
-            let image_files: Vec<PathBuf> = path
+            let image_files: Vec<_> = path
                 .read_dir()
                 .ok()?
                 .filter_map(Result::ok)
                 .map(|file_entry| file_entry.path())
-                .filter(|file_path| {
-                    file_path.is_file() && ImageFormat::from_path(file_path).is_ok()
-                })
+                .filter(|file_path| ImageFormat::from_path(file_path).is_ok())
                 .collect();
 
             (!image_files.is_empty()).then_some((folder_name, image_files))

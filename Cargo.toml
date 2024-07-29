@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1.0"
+blake3 = { version = "1.5", features = ["mmap"] }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+dunce = "1.0"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp", "gif"] }
+indicatif = { version = "0.17", features = ["tokio", "futures"] }
+memmap2 = "0.9"
+num-traits = "0.2"
+qdrant-client = { version = "1.10", features = ["serde"] }
+reqwest = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.38", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+walkdir = "2.5"
+
+# S3
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.40"
+
+# Models
+hf-hub = "0.3"
+ndarray = "0.15"
+ort = { version = "2.0.0-rc.4", features = ["cuda"] }
+
+[profile.dev.package.image]
+opt-level = 3

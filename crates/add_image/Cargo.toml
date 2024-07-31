@@ -10,16 +10,17 @@ aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
-dotenvy = { workspace = true }
 dunce = { workspace = true }
 futures-util = { workspace = true }
 image = { workspace = true }
 indicatif = { workspace = true }
 memmap2 = { workspace = true }
+num_cpus = { workspace = true }
 qdrant-client = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 
+utils = { path = "../utils" }
 models = { path = "../models" }

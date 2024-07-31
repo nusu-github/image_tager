@@ -48,7 +48,7 @@ impl Model {
         let input = stack(Axis(0), &[preprocess(image, self.target_size)?.view()])?;
         let outputs = self
             .session
-            .run_async(ort::inputs![self.input_name  => input.view()]?)?
+            .run_async(ort::inputs![self.input_name => input.view()]?)?
             .await?;
         let outputs = outputs[self.output_name]
             .try_extract_raw_tensor()?

@@ -1,20 +1,16 @@
 use std::{
-    env,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Ok, Result};
 use clap::Parser;
-use dotenvy::dotenv;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use image::ImageFormat;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ndarray::{prelude::*, stack};
 use qdrant_client::{
-    qdrant::{
-        RecommendExample, RecommendPointsBuilder, RecommendResponse, RecommendStrategy,
-        SearchParamsBuilder,
-    },
+    qdrant::{RecommendExample, RecommendPointsBuilder, RecommendResponse, SearchParamsBuilder},
     Qdrant,
 };
 use tokio::{fs, io};
@@ -23,10 +19,18 @@ use walkdir::WalkDir;
 use models::WdTagger;
 
 // Constants
-const DEFAULT_LIMIT: usize = 512;
+static ENV: LazyLock<utils::Config> = LazyLock::new(|| utils::Config::new());
+
+const DEFAULT_LIMIT: usize = 100;
 const QDRANT_SEARCH_EXACT: bool = true;
-const QDRANT_SEARCH_HNSW_EF: u64 = 64;
+const QDRANT_SEARCH_HNSW_EF: u64 = 32;
 const QDRANT_SCORE_THRESHOLD: f32 = 0.5;
+
+static QDRANT_CLIENT: LazyLock<Qdrant> =
+    LazyLock::new(|| Qdrant::from_url(ENV.qdrant_url).build().unwrap());
+
+static MODEL: LazyLock<WdTagger> =
+    LazyLock::new(|| WdTagger::new(ENV.device_id.parse().unwrap()).unwrap());
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -41,7 +45,6 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv()?;
     let config = Config::parse();
 
     let input =
@@ -58,15 +61,7 @@ async fn main() -> Result<()> {
         validate_single_image_input(&input)?
     };
 
-    let model = WdTagger::new(0).with_context(|| "Failed to initialize WdTagger model")?;
-
-    let client = create_qdrant_client().with_context(|| "Failed to create Qdrant client")?;
-    let collection_name = env::var("COLLECTION_NAME")
-        .with_context(|| "Failed to get COLLECTION_NAME from environment")?;
-
-    let batch_size = std::thread::available_parallelism()
-        .with_context(|| "Failed to get available parallelism")?
-        .get();
+    let batch_size = num_cpus::get();
 
     let bars = MultiProgress::new();
 
@@ -83,9 +78,6 @@ async fn main() -> Result<()> {
             batch_size,
             config.limit as u64,
             config.score_threshold,
-            &client,
-            &collection_name,
-            &model,
             &bars,
         )
         .await
@@ -123,14 +115,6 @@ fn validate_single_image_input(input: &Path) -> Result<Vec<(String, Vec<PathBuf>
     )])
 }
 
-fn create_qdrant_client() -> Result<Qdrant> {
-    let qdrant_url =
-        env::var("QDRANT_URL").with_context(|| "Failed to get QDRANT_URL from environment")?;
-    Qdrant::from_url(qdrant_url.as_str())
-        .build()
-        .with_context(|| "Failed to build Qdrant client")
-}
-
 async fn process_entry(
     tag: &str,
     files: &[PathBuf],
@@ -138,19 +122,16 @@ async fn process_entry(
     batch_size: usize,
     limit: u64,
     score_threshold: f32,
-    client: &Qdrant,
-    collection_name: &str,
-    model: &WdTagger,
     bars: &MultiProgress,
 ) -> Result<()> {
     let pb = bars.add(create_progress_bar()?);
     pb.set_message(tag.to_string());
 
-    let vecs = process_images(files, batch_size, model, &pb).await?;
-    let vecs = reduce_vectors(vecs, model.output_size as usize)?;
+    let vecs = process_images(files, batch_size, &pb).await?;
+    let vecs = reduce_vectors(vecs)?;
 
-    let req = build_recommend_request(collection_name, limit, score_threshold, vecs);
-    let res = client
+    let req = build_recommend_request(limit, score_threshold, vecs);
+    let res = QDRANT_CLIENT
         .recommend(req)
         .await
         .with_context(|| format!("Tag: {tag} failed to search"))?;
@@ -174,7 +155,6 @@ fn create_progress_bar() -> Result<ProgressBar> {
 async fn process_images(
     files: &[PathBuf],
     batch_size: usize,
-    model: &WdTagger,
     pb: &ProgressBar,
 ) -> Result<Vec<Vec<f32>>> {
     let images_batch = files
@@ -191,7 +171,7 @@ async fn process_images(
     pb.set_position(0);
 
     pb.wrap_stream(stream::iter(images_batch))
-        .then(|batch| async move { model.predicts(&batch).await })
+        .then(|batch| async move { MODEL.predicts(&batch).await })
         .try_fold(vec![], |mut vecs, batch| async move {
             vecs.extend(batch);
             Ok(vecs)
@@ -199,7 +179,7 @@ async fn process_images(
         .await
 }
 
-fn reduce_vectors(vecs: Vec<Vec<f32>>, output_size: usize) -> Result<Vec<Vec<f32>>> {
+fn reduce_vectors(vecs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>> {
     if vecs.len() <= 32 {
         return Ok(vecs);
     }
@@ -211,7 +191,7 @@ fn reduce_vectors(vecs: Vec<Vec<f32>>, output_size: usize) -> Result<Vec<Vec<f32
         .map(|chunk| {
             let vecs = chunk
                 .into_iter()
-                .map(|x| Ok(ArrayView1::from_shape(output_size, x)?))
+                .map(|x| Ok(ArrayView1::from_shape(MODEL.output_size as usize, x)?))
                 .collect::<Result<Vec<_>>>()?;
             let vecs = stack(Axis(0), &vecs)?;
             Ok(vecs.mean_axis(Axis(0)).unwrap().into_raw_vec())
@@ -220,14 +200,13 @@ fn reduce_vectors(vecs: Vec<Vec<f32>>, output_size: usize) -> Result<Vec<Vec<f32
 }
 
 fn build_recommend_request(
-    collection_name: &str,
     limit: u64,
     score_threshold: f32,
     vecs: Vec<Vec<f32>>,
 ) -> RecommendPointsBuilder {
     vecs.into_iter()
         .fold(
-            RecommendPointsBuilder::new(collection_name, limit),
+            RecommendPointsBuilder::new(ENV.collection_name, limit),
             |builder, vec| builder.add_positive(RecommendExample::from(vec)),
         )
         .with_payload(true)
@@ -236,7 +215,6 @@ fn build_recommend_request(
                 .exact(QDRANT_SEARCH_EXACT)
                 .hnsw_ef(QDRANT_SEARCH_HNSW_EF),
         )
-        .strategy(RecommendStrategy::BestScore)
         .score_threshold(score_threshold)
 }
 
@@ -279,7 +257,7 @@ async fn download_files(
     Ok(())
 }
 
-fn get_image_entries<P: AsRef<Path>>(root_path: P) -> Vec<(String, Vec<PathBuf>)> {
+fn get_image_entries(root_path: &Path) -> Vec<(String, Vec<PathBuf>)> {
     WalkDir::new(root_path)
         .into_iter()
         .filter_map(Result::ok)

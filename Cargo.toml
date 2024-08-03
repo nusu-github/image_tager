@@ -32,7 +32,7 @@ aws-sdk-s3 = "1.40"
 
 # Models
 hf-hub = "0.3"
-ndarray = "0.15"
+ndarray = "0.16"
 ort = { version = "2.0.0-rc.4", features = ["cuda"] }
 
 [profile.dev.package.image]

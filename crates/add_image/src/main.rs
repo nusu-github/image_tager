@@ -1,210 +1,216 @@
 use std::{
-    fs::File,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::Arc,
 };
 
-use anyhow::Result;
-use aws_config::Region;
-use aws_sdk_s3::{config::Credentials, primitives::ByteStream, Client};
+use anyhow::{Context, Result};
 use clap::Parser;
-use futures_util::{stream, StreamExt};
-use image::ImageFormat;
-use indicatif::ProgressBar;
-use memmap2::Mmap;
-use qdrant_client::{
-    qdrant::{
-        quantization_config::Quantization, CreateCollectionBuilder, Distance, PointStruct,
-        ScalarQuantizationBuilder, UpsertPointsBuilder, VectorParamsBuilder,
-    },
-    Qdrant,
-};
+use image::{ImageFormat, RgbImage};
+use indicatif::ProgressIterator;
+use qdrant_client::qdrant::PointStruct;
+use uuid::Uuid;
 use walkdir::WalkDir;
 
+use image_tager::{progress_style, Config as AppConfig, QdrantWrapper, S3Client};
 use models::WdTagger;
-
-static ENV: LazyLock<utils::Config> = LazyLock::new(|| utils::Config::new());
-
-static BASE_URL: LazyLock<String> =
-    LazyLock::new(|| format!("{}/{}", ENV.endpoint, ENV.bucket_name));
-
-static S3_CLIENT: LazyLock<Client> = LazyLock::new(|| {
-    let credentials_provider =
-        Credentials::new(ENV.access_key_id, ENV.secret_access_key, None, None, "s3");
-    let config = aws_sdk_s3::Config::builder()
-        .behavior_version_latest()
-        .credentials_provider(credentials_provider)
-        .force_path_style(true)
-        .endpoint_url(ENV.endpoint)
-        .region(Region::new(ENV.region))
-        .build();
-
-    Client::from_conf(config)
-});
-
-static QDRANT_CLIENT: LazyLock<Qdrant> =
-    LazyLock::new(|| Qdrant::from_url(ENV.qdrant_url).build().unwrap());
-
-static MODEL: LazyLock<WdTagger> =
-    LazyLock::new(|| WdTagger::new(ENV.device_id.parse().unwrap()).unwrap());
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
-struct Config {
+struct CliConfig {
     input_dir: PathBuf,
+    #[arg(short, long, default_value_t = 128)]
+    batch_size: usize,
+    #[arg(short, long, default_value_t = 0)]
+    device_id: i32,
+    #[arg(short, long, default_value_t = 16)]
+    num_threads: usize,
+}
+
+struct ImageProcessor {
+    s3_client: Arc<S3Client>,
+    qdrant_client: Arc<QdrantWrapper>,
+    model: Arc<WdTagger>,
+    num_threads: usize,
+    app_config: AppConfig,
+    base_url: String,
+}
+
+impl ImageProcessor {
+    fn new(device_id: i32, num_threads: usize) -> Result<Self> {
+        let app_config = AppConfig::new()?;
+        let base_url = format!("{}/{}", &app_config.s3_endpoint, &app_config.s3_bucket_name);
+
+        Ok(Self {
+            s3_client: Arc::from(S3Client::new()?),
+            qdrant_client: Arc::from(QdrantWrapper::new()?),
+            model: Arc::from(WdTagger::new(device_id, num_threads)?),
+            num_threads,
+            app_config,
+            base_url,
+        })
+    }
+
+    async fn process(&self, config: &CliConfig) -> Result<()> {
+        let input_dir = self.canonicalize_input_dir(&config.input_dir)?;
+        self.ensure_image_collection_exists().await?;
+
+        let entries = self.get_image_entries(&input_dir);
+        self.process_entries(entries, config.batch_size).await
+    }
+
+    fn canonicalize_input_dir(&self, input_dir: &Path) -> Result<PathBuf> {
+        dunce::canonicalize(input_dir).context("Failed to canonicalize input directory")
+    }
+
+    async fn ensure_image_collection_exists(&self) -> Result<()> {
+        if self
+            .qdrant_client
+            .get_collection_info(&self.app_config.collection_name)
+            .await
+            .is_err()
+        {
+            self.qdrant_client
+                .create_collection(
+                    &self.app_config.collection_name,
+                    self.model.output_size as u64,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn get_image_entries(&self, input_dir: &Path) -> Vec<PathBuf> {
+        WalkDir::new(input_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|e| e.into_path())
+            .filter(|e| ImageFormat::from_path(e).is_ok())
+            .collect()
+    }
+
+    async fn process_entries(&self, entries: Vec<PathBuf>, batch_size: usize) -> Result<()> {
+        for batch in entries
+            .chunks(batch_size)
+            .progress_with_style(progress_style()?)
+        {
+            let processed_batch = self.process_batch(batch).await?;
+            self.upload_and_index_batch(processed_batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn process_batch(&self, batch: &[PathBuf]) -> Result<Vec<ProcessedImage>> {
+        let mut processed_batch = Vec::new();
+        for paths in batch.chunks(self.num_threads) {
+            let datas = self.load_and_hash_images(paths).await?;
+            let vectors = self
+                .model
+                .predicts(&datas.iter().map(|d| d.image.clone()).collect::<Vec<_>>())
+                .await?;
+
+            processed_batch.extend(datas.into_iter().zip(vectors).map(|(data, vector)| {
+                ProcessedImage {
+                    path: data.path,
+                    vector,
+                    hash: data.hash,
+                }
+            }));
+        }
+        Ok(processed_batch)
+    }
+
+    async fn load_and_hash_images(&self, paths: &[PathBuf]) -> Result<Vec<ImageData>> {
+        futures_util::future::try_join_all(paths.iter().map(|path| self.load_and_hash_image(path)))
+            .await
+    }
+
+    async fn load_and_hash_image(&self, path: &Path) -> Result<ImageData> {
+        tokio::task::spawn_blocking({
+            let path = path.to_owned();
+            move || -> Result<ImageData> {
+                let mut hasher = blake3::Hasher::new();
+                let hash = hasher.update_mmap(&path)?.finalize().to_string();
+                let image = image::open(&path)?.into_rgb8();
+                Ok(ImageData { path, image, hash })
+            }
+        })
+            .await?
+    }
+
+    async fn upload_and_index_batch(&self, batch: Vec<ProcessedImage>) -> Result<()> {
+        let qdrant_points: Vec<_> = futures_util::future::join_all(
+            batch.into_iter().map(|img| self.prepare_qdrant_point(img)),
+        )
+            .await;
+
+        self.qdrant_client
+            .add_points(&self.app_config.collection_name, qdrant_points)
+            .await
+    }
+
+    async fn prepare_qdrant_point(&self, img: ProcessedImage) -> PointStruct {
+        let filename = format!(
+            "{}.{}",
+            img.hash,
+            img.path.extension().unwrap().to_str().unwrap()
+        );
+        let full_url = format!("{}/{}", self.base_url, filename);
+
+        // Upload file to S3 if it doesn't exist
+        if let Err(e) = self.upload_to_s3_if_not_exists(&img.path, &filename).await {
+            eprintln!("Failed to upload file to S3: {}", e);
+        }
+
+        self.create_qdrant_point(
+            &img.hash,
+            img.vector,
+            img.path.file_name().unwrap().to_str().unwrap(),
+            &full_url,
+        )
+    }
+
+    async fn upload_to_s3_if_not_exists(&self, path: &Path, filename: &str) -> Result<()> {
+        if !self.s3_client.search_file(filename).await? {
+            let data = tokio::fs::read(path).await?;
+            self.s3_client.upload_file(filename, &data).await?;
+        }
+        Ok(())
+    }
+
+    fn create_qdrant_point(
+        &self,
+        hash: &str,
+        vector: Vec<f32>,
+        path_str: &str,
+        full_url: &str,
+    ) -> PointStruct {
+        PointStruct::new(
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, hash.as_ref()).to_string(),
+            vector,
+            [
+                ("path", path_str.into()),
+                ("hash", hash.into()),
+                ("url", full_url.into()),
+            ],
+        )
+    }
+}
+
+struct ProcessedImage {
+    path: PathBuf,
+    vector: Vec<f32>,
+    hash: String,
+}
+
+struct ImageData {
+    path: PathBuf,
+    image: RgbImage,
+    hash: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::parse();
-    let input_dir = dunce::canonicalize(&config.input_dir)?;
-
-    ensure_image_collection_exists().await?;
-
-    let entries = get_image_entries(&input_dir);
-    let pb = ProgressBar::new(entries.len() as u64);
-    pb.set_style(indicatif::ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-    )?);
-
-    process_images(entries, pb).await?;
-
-    Ok(())
-}
-
-async fn ensure_image_collection_exists() -> Result<()> {
-    if !QDRANT_CLIENT.collection_exists(ENV.collection_name).await? {
-        QDRANT_CLIENT
-            .create_collection(
-                CreateCollectionBuilder::new(ENV.collection_name)
-                    .vectors_config(
-                        VectorParamsBuilder::new(MODEL.output_size as u64, Distance::Cosine)
-                            .on_disk(true),
-                    )
-                    .quantization_config(Quantization::Scalar(
-                        ScalarQuantizationBuilder::default().build(),
-                    )),
-            )
-            .await?;
-    }
-    Ok(())
-}
-
-fn get_image_entries(input_dir: &Path) -> Vec<PathBuf> {
-    WalkDir::new(input_dir)
-        .into_iter()
-        .filter_map(|e| e.and_then(|e| Ok(e.into_path())).ok())
-        .filter(|e| ImageFormat::from_path(e).is_ok())
-        .collect()
-}
-
-async fn process_images(entries: Vec<PathBuf>, pb: ProgressBar) -> Result<()> {
-    let cpu = num_cpus::get();
-
-    pb.wrap_stream(stream::iter(entries))
-        .map(|path| {
-            tokio::spawn(async move {
-                process_single_image(&path)
-                    .await
-                    .map(|(image, hash)| (path, image, hash))
-            })
-        })
-        .buffer_unordered(cpu)
-        .map(|x| x?)
-        .map(|result| {
-            tokio::spawn(async move {
-                let (path, image, hash) = result?;
-                match image {
-                    Some(image) => MODEL
-                        .predict(&image.into_rgb8())
-                        .await
-                        .map(|vector| (path, Some(vector), hash)),
-                    None => Ok((path, None, hash)),
-                }
-            })
-        })
-        .buffer_unordered(cpu)
-        .map(|x| x?)
-        .map(|result| {
-            tokio::spawn(async move {
-                let (path, vector, hash) = result?;
-                match vector {
-                    Some(vector) => upload_and_index(&path, vector, &hash).await,
-                    None => Ok(()),
-                }
-            })
-        })
-        .buffer_unordered(cpu)
-        .map(|x| x?)
-        .then(|result| {
-            let pb = pb.clone();
-            async move {
-                if let Err(e) = result {
-                    pb.println(format!("Error: {:?}", e));
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .await;
-
-    pb.finish();
-
-    Ok(())
-}
-
-async fn process_single_image(path: &Path) -> Result<(Option<image::DynamicImage>, String)> {
-    let mut hasher = blake3::Hasher::new();
-    let hash = hasher.update_mmap(path)?.finalize().to_hex().to_string();
-
-    let filename = format!("{}.{}", hash, path.extension().unwrap().to_str().unwrap());
-
-    let object = S3_CLIENT
-        .get_object()
-        .bucket(ENV.bucket_name)
-        .key(&filename)
-        .send()
-        .await;
-
-    match object {
-        Ok(_) => Ok((None, hash)),
-        Err(_) => {
-            let mmap = unsafe { Mmap::map(&File::open(path)?)? };
-            let img = image::load_from_memory_with_format(&mmap, ImageFormat::from_path(path)?)?;
-            Ok((Some(img), hash))
-        }
-    }
-}
-
-async fn upload_and_index(path: &Path, vector: Vec<f32>, hash: &str) -> Result<()> {
-    let filename = format!("{}.{}", hash, path.extension().unwrap().to_str().unwrap());
-    let full_url = format!("{}/{}", BASE_URL.as_str(), filename);
-
-    // Upload to S3
-    let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
-    S3_CLIENT
-        .put_object()
-        .bucket(ENV.bucket_name)
-        .key(&filename)
-        .body(ByteStream::from(mmap.to_vec()))
-        .send()
-        .await?;
-
-    // Index in Qdrant
-    let path_str = path.file_name().unwrap().to_str().unwrap().to_string();
-    QDRANT_CLIENT
-        .upsert_points(UpsertPointsBuilder::new(
-            ENV.collection_name,
-            vec![PointStruct::new(
-                uuid::Uuid::new_v4().to_string(),
-                vector,
-                [
-                    ("hash", hash.into()),
-                    ("path", path_str.into()),
-                    ("url", full_url.into()),
-                ],
-            )],
-        ))
-        .await?;
-
-    Ok(())
+    let config = CliConfig::parse();
+    let processor = ImageProcessor::new(config.device_id, config.num_threads)?;
+    processor.process(&config).await
 }
